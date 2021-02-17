@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# poshack is a workaround on positioning windows.
+# xdotool get correct position, but is not able to
+# position windows at same x,y as retreived ...
+#
+# Look at resore_window() for how it is done.
+declare -i poshack=1
+
 declare -ir tcols=$(tput cols)
 declare -i dryrun=0
 declare -r tmpdir="/tmp/mywinrestore"
@@ -133,16 +140,18 @@ restore_window()
 	local -i rx ry
 	(( rx = x - X ))
 	(( ry = y - Y ))
-	printf "%5d,%-5d => a: %5d,%-5d r: %5d,%-5d\n" $X $Y $x $y $rx $ry
+	printf "%5d,%-5d|%5d,%-5d => a: %5d,%-5d r: %5d,%-5d z: %5d,%d\n" $X $Y $W $H $x $y $rx $ry $w $h
 	(( dryrun )) && return
-	xdotool windowmove --relative -- $wid $rx $ry
-	#xdotool windowmove -- $wid $x $y
-	#! ((dryrun)) && wmctrl -i -r "$wid" -e 0,$x,$y,-1,-1
+	xdotool windowmove --sync -- $wid $x $y
+	xdotool windowsize --sync -- $wid $w $h
+	! (( poshack )) && return
+	# poshack:
+	#   correct position set by windowmove
 	check_change
 	(( rx = (x - X) * 2 ))
 	(( ry = (y - Y) * 2 ))
-	printf "%5d,%-5d => a: %5d,%-5d r: %5d,%-5d\n\n" $X $Y $x $y $rx $ry
-	xdotool windowmove --relative -- $wid $rx $ry
+	printf "%5d,%-5d|%5d,%-5d => a: %5d,%-5d r: %5d,%-5d z: %5d,%d\n" $X $Y $W $H $x $y $rx $ry $w $h
+	xdotool windowmove --sync --relative -- $wid $rx $ry
 }
 # Read file, $1, typically saved by -s
 # Parse wid, and old x, y, w, h from lines in file
@@ -225,6 +234,7 @@ print_help()
 	printf "  -l --list              List saved.\n"
 	printf "  -v --verbose           Be verbose.\n"
 	printf "  -d --dryrun            Dry run when restoring.\n"
+	printf "     --no-poshack        Disable position hack.\n"
 	printf "     --                  End of options.\n"
 	printf "  -h --help              This help.\n"
 	printf "\n"
@@ -264,6 +274,7 @@ main()
 		-l|--list) cmd=list ;;
 		-f|--file) cmd=from_file ;;
 		-v|--verbose) verbose=1 ;;
+		--no-poshack) poshack=0 ;;
 		--|"") break;;
 		*) print_help "$0" "$f" >&2; exit 1 ;;
 		esac
