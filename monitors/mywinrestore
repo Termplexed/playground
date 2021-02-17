@@ -1,0 +1,275 @@
+#!/bin/bash
+
+declare -ir tcols=$(tput cols)
+declare -i dryrun=0
+declare -r tmpdir="/tmp/mywinrestore"
+! [ -d "$tmpdir" ] && mkdir "$tmpdir"
+
+# Unicode substring
+usubstr()
+{
+	local -i chars bytes len
+	local -ri offset="$2"
+	local -ri realestate="$3"
+	local -r txt="$1"
+
+	read -r chars bytes<<< $(printf %s "$s" | wc -mc)
+	(( len = realestate + chars - bytes ))
+	printf %s "${txt:offset:len}"
+}
+# Remove spaces and trim to fit columns
+trim_title()
+{
+	local -ir wid=$1
+	local -ir col=$2
+	# Trim all repeated whitespace in title (awk)
+	name="$(xdotool getwindowname $wid | sed 's/\s\+/ /g')"
+	printf "%s" "$(usubstr "$name" 0 $col)"
+}
+# Get geometry of window id $1
+# X, Y, W, H should be defined in calling function.
+# Return 1 if window-id does not exist.
+xget_geom()
+{
+	local r k v
+	r=$(xdotool getwindowgeometry --shell "$1" 2>/dev/null)
+	[ $? -eq 0 ] || return 1
+	while IFS='=' read -r k v; do
+		case $k in
+		X) X=$v ;;
+		Y) Y=$v ;;
+		WIDTH) W=$v ;;
+		HEIGHT) H=$v ;;
+		esac
+	done<<< "$r"
+
+	return 0
+}
+# Header
+print_header()
+{
+	printf "#      ID     X     Y     W     H TITLE\n"
+}
+# List all current windows (plain)
+list_windows()
+{
+	local -i X Y W H wid
+	local name
+	local -ir desk_nr=$(xdotool get_desktop)
+
+	print_header
+
+	while read -r wid; do
+		# eval $(xdotool getwindowgeometry --shell $wid)
+		xget_geom $wid || continue
+		name="$(xdotool getwindowname $wid | sed 's/\s\+/ /g')"
+		printf "0x%-7x %5d %5d %5d %5d %s\n" $wid $X $Y $W $H "$name"
+	done<<< $(xdotool search -desktop $desk_nr -name .)
+}
+# Colorize output from list_windows()
+colorize()
+{
+	local -ir title_width=$(( tcols - 34 ))
+	local -i x y w h
+	local wid title
+	read -r header
+	printf "#\e[1;34m%s\e[0m\n" "${header:1}"
+	while read -r wid x y w h title; do
+		name=$(usubstr "$title" 0 $title_width)
+		printf "0x%-7x %5d %5d %5d %5d \e[32m%s\e[0m\n" $wid $x $y $w $h "$name"
+	done
+}
+# List all current windows.
+# Colorized if to terminal
+print_current()
+{
+	if [ -t 1 ]; then
+		list_windows | colorize
+	else
+		list_windows
+	fi
+}
+# Print a saved file.
+# Colorize if output to terminal
+print_file()
+{
+	if [ -t 1 ]; then
+		colorize <"$1"
+	else
+		cat "$1"
+	fi
+}
+# Save current windows to file
+# If verbose also print the result file
+save()
+{
+	local -i verbose=$1
+	local tmp=$(mktemp -p "$tmpdir" mywinrestore.XXXXXX)
+	list_windows >>"$tmp"
+	[ $verbose = 1 ] && print_file "$tmp"
+}
+# List saved files. Sorted new to old.
+list_tmp_files()
+{
+	find "$tmpdir" -name "mywinrestore.*" -type f -printf '%TY-%Tm-%Td %TT %p\n' | \
+	sort -r
+}
+# Check if x,y,w,h is equal to X,Y,W,H
+# Lowercase typically read from file
+# Uppercase set by call to xget_geom
+# Return
+# 	0: equal
+# 	1: changed
+# 	2: window-id does not exists
+check_change()
+{
+	xget_geom "$wid" || return 2
+	[ "$x" = "$X" -a "$y" = "$Y" -a "$w" = "$W" -a "$h" = "$H" ] \
+	&& return 0 \
+	|| return 1
+}
+restore_window()
+{
+	local -i rx ry
+	(( rx = x - X ))
+	(( ry = y - Y ))
+	printf "%5d,%-5d => a: %5d,%-5d r: %5d,%-5d\n" $X $Y $x $y $rx $ry
+	(( dryrun )) && return
+	xdotool windowmove --relative -- $wid $rx $ry
+	#xdotool windowmove -- $wid $x $y
+	#! ((dryrun)) && wmctrl -i -r "$wid" -e 0,$x,$y,-1,-1
+	check_change
+	(( rx = (x - X) * 2 ))
+	(( ry = (y - Y) * 2 ))
+	printf "%5d,%-5d => a: %5d,%-5d r: %5d,%-5d\n\n" $X $Y $x $y $rx $ry
+	xdotool windowmove --relative -- $wid $rx $ry
+}
+# Read file, $1, typically saved by -s
+# Parse wid, and old x, y, w, h from lines in file
+# If different from current call restore_window()
+restore_from_file()
+{
+	local wid title
+	local -i x y w h
+	local -i X Y W H
+	print_header
+	while read -r wid x y w h title; do
+		if [ "$wid" != "#" ]; then
+			check_change
+			case $? in
+			0) ;; #echo "SAME";;
+			1)
+				printf -- "%s %s\n" "$wid" "$title"
+				echo "RESTORE";
+				restore_window;;
+			2) ;; #echo "NOEXIST";;
+			esac
+		fi
+	done< "$1"
+}
+# Restore form backup / tmpfile
+# Default to newest, else use index: $2
+# Index is gotten by -l, list()
+# $1 is verbosity, not used.
+restore()
+{
+	local file
+	local -i n=1
+	[ -n "$2" ] && n=$2
+	if [ $n -lt 1 ]; then
+		printf "Index (%d) out of range, try -l\n" $n >&2
+		return 1
+	fi
+	read -r _ _ file<<< $(list_tmp_files | sed -n $n'p')
+	if [ -z "$file" ]; then
+		printf "Index (%d) out of range, try -l\n" $n >&2
+		exit 1
+	else
+		restore_from_file "$file"
+	fi
+}
+# List saved tmpfiles
+# If verbose: $1, also print the content
+list()
+{
+	local -i verbose=$1
+	local -i n=0
+	local -i len
+	local d t f
+	local fmt="%3d %s %s %3d %s"
+	[ -t 1 ] && fmt="#\e[1;33m$fmt\e[0m\n" || fmt="# $fmt\n"
+	printf "# dir: %s\n" "$tmpdir"
+	printf "#  N modified                   windows tmpfile\n"
+	while read -r d t f; do
+		len=$(sed -n '/^[^#]/p' "$f" | wc -l)
+		printf -- "$fmt" \
+			"$(( ++n ))" \
+			"$d" "$t" \
+			"$len" \
+			"$(basename "$f")"
+		[ $verbose = 1 ] && print_file "$f"
+	done<<< $(list_tmp_files | sort -r)
+}
+print_help()
+{
+	printf "Usage: %s [OPTIONS]\n" "$(basename "$1")"
+	printf "\n"
+	printf " Save position and size of windows for later restore.\n"
+	printf " Mainly used in combination with changing active monitors\n"
+	printf " with \`xrandr' as restoring monitors scatter windows.\n"
+	printf "\n"
+	printf "OPTIONS\n"
+	printf "  -s --save              Save current windows.\n"
+	printf "  -r --restore   [N]     Restore. Default to last save.\n"
+	printf "  -f --from-file <FILE>  Restore from file.\n"
+	printf "  -l --list              List saved.\n"
+	printf "  -v --verbose           Be verbose.\n"
+	printf "  -d --dryrun            Dry run when restoring.\n"
+	printf "     --                  End of options.\n"
+	printf "  -h --help              This help.\n"
+	printf "\n"
+	printf "DEPENDENCIES\n"
+	printf " xdotools, sed, wc, find, mktemp, tput, sort, cat, bash\n"
+	[ -n "$2" ] && printf "\nUnknown option: %s\n" "$2"
+}
+main()
+{
+	local cmd=print_current
+	local -i verbose=0
+	local f="x"
+	local o=""
+	local -a extra=()
+	if [ -z "$1" ]; then
+		print_current
+		printf "# Current Windows, -h or --help for help\n"
+		return
+	fi
+	while [ -n "$f" ]; do
+		if [ -z "$o" ] || [ "$o" = "-" ]; then
+			o=$1
+			shift
+		fi
+		if [[ "$o" =~ ^-[^-].+ ]]; then
+			f="-${o:1:1}"
+			o="-${o:2}"
+		else
+			f="$o"
+			o=""
+		fi
+		case "$f" in
+		-h|--help) print_help "$0" >&2; exit 1;;
+		-d|--dryrun) dryrun=1 ;;
+		-s|--save) cmd=save ;;
+		-r|--restore) cmd=restore; [ "${1:0:1}" != "-" ] && extra+=($1) && shift;;
+		-l|--list) cmd=list ;;
+		-f|--file) cmd=from_file ;;
+		-v|--verbose) verbose=1 ;;
+		--|"") break;;
+		*) print_help "$0" "$f" >&2; exit 1 ;;
+		esac
+	done
+	$cmd $verbose "${extra[@]}"
+}
+
+main "$@"
+
